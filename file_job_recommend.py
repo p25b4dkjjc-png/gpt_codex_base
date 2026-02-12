@@ -325,6 +325,28 @@ def _dedupe_keep_order(items):
     return list(dict.fromkeys(items))
 
 
+def _extract_keywords(text: Optional[str], min_len: int = 2, max_terms: int = 25) -> List[str]:
+    """从文本中抽取关键词，兼容中英文。"""
+    if not text:
+        return []
+    tokens = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][A-Za-z0-9+#.\-]{1,}", str(text).lower())
+    stop_words = {
+        "负责", "参与", "熟悉", "掌握", "了解", "进行", "相关", "工作", "经验", "能力", "职位", "岗位",
+        "the", "and", "for", "with", "from", "this", "that", "have", "has", "using"
+    }
+    filtered = [t for t in tokens if len(t) >= min_len and t not in stop_words]
+    return _dedupe_keep_order(filtered)[:max_terms]
+
+
+def _keyword_overlap_score(resume_keywords: List[str], job_text: str) -> float:
+    """计算关键词覆盖得分，范围 [0, 1]。"""
+    if not resume_keywords or not job_text:
+        return 0.0
+    text_lower = job_text.lower()
+    hits = sum(1 for kw in resume_keywords if kw in text_lower)
+    return min(1.0, hits / max(4, len(resume_keywords)))
+
+
 # ----------------------------- 修复1: Pydantic 2.0 兼容性 ----------------------------
 def _req_to_filters(req) -> Dict[str, Any]:
     """兼容 Pydantic v1/v2，优先使用 model_dump (v2)"""
@@ -538,9 +560,33 @@ def build_resume_text(resume: dict) -> str:
         for _ in range(weight):
             parts.append(text)
 
+    add(basic.get("intent"), 4)
     add(basic.get("major"), 3)
     add(basic.get("courses"), 2)
-    return "".join(parts)
+    add(resume.get("skills"), 2)
+
+    project_exp = resume.get("project_exp", [])
+    if isinstance(project_exp, list):
+        for item in project_exp[:2]:
+            if isinstance(item, dict):
+                add(item.get("content"), 1)
+
+    return "\n".join(str(p) for p in parts if p)
+
+
+def build_resume_profile(resume: dict) -> Dict[str, Any]:
+    """构建用于匹配打分的简历画像。"""
+    basic = resume.get("basic_info", {}) if isinstance(resume, dict) else {}
+    profile_texts = [
+        basic.get("intent"),
+        basic.get("major"),
+        basic.get("courses"),
+        resume.get("skills") if isinstance(resume, dict) else None,
+    ]
+    text_blob = "\n".join(str(t) for t in profile_texts if t)
+    keywords = _extract_keywords(text_blob)
+    intent_keywords = _extract_keywords(str(basic.get("intent") or ""), max_terms=10)
+    return {"keywords": keywords, "intent_keywords": intent_keywords}
 
 
 # ----------------------------- Milvus查询（优化版） -----------------------------
@@ -774,7 +820,7 @@ async def search_sxxz_service_optimized(filters: Dict) -> Dict[str, Any]:
                 top_k=rerank_cutoff,
                 candidate_limit=rerank_cutoff
             )
-            return [r["job_id"] for r in results]
+            return results
 
         resume_task = resume_recall()
     else:
@@ -782,7 +828,15 @@ async def search_sxxz_service_optimized(filters: Dict) -> Dict[str, Any]:
 
     # 并行执行
     results = await resume_task
-    resume_ids = results if resume else []
+    recall_results = results if resume else []
+    resume_ids = [r["job_id"] for r in recall_results]
+    recall_score_map = {
+        int(r["job_id"]): {
+            "job_sim": float(r.get("job_sim", 0.0)),
+            "rrf_score": float(r.get("rrf_score", 0.0)),
+        }
+        for r in recall_results
+    }
 
     logger.info(f"实习校招召回完成 - 简历: {len(resume_ids)}个, 耗时: {time.time() - start_time:.2f}s")
 
@@ -805,6 +859,8 @@ async def search_sxxz_service_optimized(filters: Dict) -> Dict[str, Any]:
             "job_name": doc["job_name"],
             "job_describe": doc["job_describe"],
             "city": doc["city"],
+            "job_sim": recall_score_map.get(jid, {}).get("job_sim", 0.0),
+            "recall_rrf_score": recall_score_map.get(jid, {}).get("rrf_score", 0.0),
         }
         for jid in rerank_ids
         if (doc := id_to_doc.get(jid)) is not None
@@ -815,6 +871,9 @@ async def search_sxxz_service_optimized(filters: Dict) -> Dict[str, Any]:
     documents = [f"{c['job_name']}\n{c['job_describe']}" for c in candidates]
 
     rerank_results = await AsyncRerankClient.rerank(query_text, documents, top_k=len(candidates))
+    resume_profile = build_resume_profile(resume or {})
+    resume_keywords = resume_profile["keywords"]
+    intent_keywords = resume_profile["intent_keywords"]
 
     if rerank_results:
         reranked = []
@@ -822,10 +881,28 @@ async def search_sxxz_service_optimized(filters: Dict) -> Dict[str, Any]:
             idx = r["index"]
             if 0 <= idx < len(candidates):
                 item = candidates[idx].copy()
-                item["rerank_score"] = r["score"]
+                job_text = f"{item.get('job_name', '')}\n{item.get('job_describe', '')}"
+                keyword_score = _keyword_overlap_score(resume_keywords, job_text)
+                intent_score = _keyword_overlap_score(intent_keywords, item.get("job_name", ""))
+                rerank_score = float(r.get("score", 0.0))
+                recall_score = float(item.get("job_sim", 0.0))
+                final_score = 0.6 * rerank_score + 0.25 * recall_score + 0.1 * keyword_score + 0.05 * intent_score
+                item["rerank_score"] = rerank_score
+                item["keyword_score"] = keyword_score
+                item["intent_score"] = intent_score
+                item["final_score"] = final_score
                 reranked.append(item)
+        reranked.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
     else:
-        reranked = [dict(item, rerank_score=0.0) for item in candidates]
+        reranked = []
+        for item in candidates:
+            job_text = f"{item.get('job_name', '')}\n{item.get('job_describe', '')}"
+            keyword_score = _keyword_overlap_score(resume_keywords, job_text)
+            intent_score = _keyword_overlap_score(intent_keywords, item.get("job_name", ""))
+            recall_score = float(item.get("job_sim", 0.0))
+            final_score = 0.85 * recall_score + 0.1 * keyword_score + 0.05 * intent_score
+            reranked.append(dict(item, rerank_score=0.0, keyword_score=keyword_score, intent_score=intent_score, final_score=final_score))
+        reranked.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
 
     # ========== 4. 分页 ==========
     start = (page - 1) * page_size
