@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import re
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Tuple, Optional, Union, List
 import tempfile
@@ -47,6 +49,7 @@ _semaphore: Optional[asyncio.Semaphore] = None  # 限制并发数
 
 # 连接池复用
 _aiohttp_session: Optional[aiohttp.ClientSession] = None
+_llm_parse_tasks: Dict[str, Dict[str, Any]] = {}
 
 
 def get_ocr_instance() -> RapidOCR:
@@ -477,6 +480,164 @@ OCR文本如下：
     return {"error": "未知错误"}
 
 
+def _normalize_line(line: str) -> str:
+    return re.sub(r"\s+", " ", line).strip("：:|·•- \t")
+
+
+def _split_resume_lines(resume_text: str) -> List[str]:
+    return [_normalize_line(line) for line in resume_text.splitlines() if _normalize_line(line)]
+
+
+def _extract_intent(lines: List[str]) -> str:
+    """基于规则提取求职意向（行业无关，兼容中英文简历）。"""
+    heading_pattern = re.compile(
+        r"^(求职意向|求职目标|应聘岗位|目标职位|期望岗位|期望职位|应聘方向|意向岗位|"
+        r"job\s*objective|target\s*position|desired\s*position|career\s*objective)",
+        re.IGNORECASE,
+    )
+
+    for idx, line in enumerate(lines):
+        if heading_pattern.search(line):
+            # 先尝试同行冒号后内容
+            if "：" in line or ":" in line:
+                right = _normalize_line(re.split(r"[：:]", line, maxsplit=1)[1])
+                if right and len(right) <= 40:
+                    return right
+            # 再尝试下一行
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1]
+                if len(nxt) <= 40 and not re.search(r"(教育|项目|工作|技能|证书|经历)", nxt):
+                    return nxt
+
+    # 全文兜底：提取“应聘/期望/目标 + 岗位名称”
+    fallback_pattern = re.compile(
+        r"(?:应聘|期望|目标|意向)\s*(?:岗位|职位)?\s*[：:]?\s*([\u4e00-\u9fa5A-Za-z0-9+/#\-· ]{2,30})"
+    )
+    for line in lines:
+        match = fallback_pattern.search(line)
+        if match:
+            return _normalize_line(match.group(1))
+
+    return ""
+
+
+def _extract_skills(lines: List[str]) -> List[str]:
+    """规则提取专业技能，支持通用行业关键词，不绑定某一垂直领域。"""
+    section_keywords = re.compile(r"(专业技能|技能特长|技能清单|核心技能|职业技能|skills?)", re.IGNORECASE)
+    stop_words = {
+        "熟悉", "掌握", "了解", "精通", "具备", "能够", "使用", "擅长", "技能", "专业", "核心", "熟练",
+        "good", "proficient", "familiar", "skilled", "with", "and", "or"
+    }
+    skill_pattern = re.compile(
+        r"\b(?:[A-Za-z][A-Za-z0-9+.#/_-]{1,20}|[\u4e00-\u9fa5]{2,12})\b"
+    )
+
+    candidates: List[str] = []
+    for idx, line in enumerate(lines):
+        if section_keywords.search(line):
+            window = lines[idx:min(idx + 12, len(lines))]
+            candidates.extend(window)
+
+    if not candidates:
+        candidates = lines
+
+    parsed: List[str] = []
+    for line in candidates:
+        for token in skill_pattern.findall(line):
+            token = token.strip(".,;:|()[]{}")
+            if not token:
+                continue
+            lower_token = token.lower()
+            if lower_token in stop_words:
+                continue
+            if len(token) <= 1:
+                continue
+            if re.fullmatch(r"\d+[年月日]?", token):
+                continue
+            parsed.append(token)
+
+    # 去重并保序，优先保留高信息量词
+    seen = set()
+    skills = []
+    for item in parsed:
+        key = item.lower()
+        if key not in seen and len(item) <= 30:
+            seen.add(key)
+            skills.append(item)
+
+    return skills[:30]
+
+
+def _extract_experience_by_rule(lines: List[str]) -> List[Dict[str, str]]:
+    """提取项目/实习/兼职经历，统一输出便于岗位快速匹配。"""
+    block_patterns = [
+        re.compile(r"项目经历|项目经验|project\s*experience", re.IGNORECASE),
+        re.compile(r"实习经历|实习经验|intern(ship)?\s*experience", re.IGNORECASE),
+        re.compile(r"兼职经历|兼职经验|part\s*-?time\s*experience", re.IGNORECASE),
+    ]
+    date_pattern = re.compile(
+        r"((?:19|20)\d{2}[./年-](?:0?[1-9]|1[0-2])(?:月)?\s*[-~至]\s*(?:(?:19|20)\d{2}[./年-](?:0?[1-9]|1[0-2])(?:月)?|至今|Now|Present))",
+        re.IGNORECASE,
+    )
+
+    experiences: List[Dict[str, str]] = []
+    for idx, line in enumerate(lines):
+        if not any(p.search(line) for p in block_patterns):
+            continue
+
+        section_lines = lines[idx + 1:min(idx + 28, len(lines))]
+        current = {"type": _normalize_line(line), "duration": "", "title": "", "content": ""}
+
+        for sec_line in section_lines:
+            if re.search(r"(教育|技能|证书|自我评价|校园活动|获奖|语言能力)", sec_line):
+                break
+            if any(p.search(sec_line) for p in block_patterns):
+                break
+
+            if not current["duration"]:
+                matched = date_pattern.search(sec_line)
+                if matched:
+                    current["duration"] = matched.group(1)
+                    continue
+
+            if not current["title"] and 2 <= len(sec_line) <= 50:
+                current["title"] = sec_line
+                continue
+
+            if len(sec_line) > 4:
+                current["content"] += (sec_line + "；")
+
+        if current["title"] or current["content"]:
+            current["content"] = current["content"].strip("；")
+            experiences.append(current)
+
+    return experiences[:6]
+
+
+def extract_resume_fast_fields(resume_text: str) -> Dict[str, Any]:
+    """主线程规则提取：用于快速岗位匹配。"""
+    lines = _split_resume_lines(resume_text)
+    intent = _extract_intent(lines)
+    skills = _extract_skills(lines)
+    exp = _extract_experience_by_rule(lines)
+    return {
+        "intent": intent,
+        "skills": skills,
+        "project_or_internship_or_parttime_exp": exp,
+    }
+
+
+async def _run_llm_parse_task(task_id: str, resume_text: str) -> None:
+    """后台异步执行大模型结构化解析，结果可用于后续入库。"""
+    try:
+        _llm_parse_tasks[task_id]["status"] = "running"
+        _llm_parse_tasks[task_id]["result"] = await resume_text_get(resume_text)
+        _llm_parse_tasks[task_id]["status"] = "done"
+    except Exception as e:
+        _llm_parse_tasks[task_id]["status"] = "failed"
+        _llm_parse_tasks[task_id]["result"] = {"error": str(e)}
+
+
 # ============ 优化4: 主流程增加并发控制和异步化 ============
 
 async def parse_resume(inputs: str) -> Dict:
@@ -495,11 +656,21 @@ async def parse_resume(inputs: str) -> Dict:
                 resume_text = await extract_ocr_content_async(inputs)
                 ocr_time = time.time()
                 logger.info(f"图片OCR完成，耗时: {ocr_time - start_time:.2f}s")
-                # print('resume_text--->', resume_text)
-                # 异步大模型解析
-                qwen_result = await resume_text_get(resume_text)
-                logger.info(f"大模型解析完成，总耗时: {time.time() - start_time:.2f}s")
-                return qwen_result
+
+                # 主线程规则提取（用于快速匹配岗位）
+                fast_fields = extract_resume_fast_fields(resume_text)
+
+                # 后台异步大模型提取（用于后续入库）
+                task_id = str(uuid.uuid4())
+                _llm_parse_tasks[task_id] = {"status": "queued", "result": None}
+                asyncio.create_task(_run_llm_parse_task(task_id, resume_text))
+
+                logger.info(f"规则提取完成，总耗时: {time.time() - start_time:.2f}s")
+                return {
+                    "fast_extract": fast_fields,
+                    "llm_task_id": task_id,
+                    "llm_task_status": "queued",
+                }
 
             # ================= PDF 简历 =================
             elif input_type == "pdf":
@@ -507,11 +678,21 @@ async def parse_resume(inputs: str) -> Dict:
                 text = await extract_text_from_pdf_async(inputs)
                 pdf_time = time.time()
                 logger.info(f"PDF解析完成，耗时: {pdf_time - start_time:.2f}s")
-                # print('resume_text--->', text)
-                # 异步大模型解析
-                qwen_result = await resume_text_get(text)
-                logger.info(f"大模型解析完成，总耗时: {time.time() - start_time:.2f}s")
-                return qwen_result
+
+                # 主线程规则提取（用于快速匹配岗位）
+                fast_fields = extract_resume_fast_fields(text)
+
+                # 后台异步大模型提取（用于后续入库）
+                task_id = str(uuid.uuid4())
+                _llm_parse_tasks[task_id] = {"status": "queued", "result": None}
+                asyncio.create_task(_run_llm_parse_task(task_id, text))
+
+                logger.info(f"规则提取完成，总耗时: {time.time() - start_time:.2f}s")
+                return {
+                    "fast_extract": fast_fields,
+                    "llm_task_id": task_id,
+                    "llm_task_status": "queued",
+                }
 
             else:
                 raise HTTPException(status_code=400, detail="简历格式不正确")
@@ -616,6 +797,15 @@ async def health_check():
         "thread_pool_workers": _thread_pool._max_workers if _thread_pool else 0,
         "semaphore_limit": 3
     }
+
+
+@app.get("/api/v1/resume/parse_task/{task_id}")
+async def get_parse_task(task_id: str) -> Any:
+    """查询后台大模型结构化解析任务状态。"""
+    task = _llm_parse_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"success": True, "task_id": task_id, **task}
 
 
 if __name__ == '__main__':
