@@ -4,6 +4,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Tuple, Optional, Union, List
 import tempfile
+import hashlib
 import shutil
 import cv2
 import dashscope
@@ -47,6 +48,85 @@ _semaphore: Optional[asyncio.Semaphore] = None  # 限制并发数
 
 # 连接池复用
 _aiohttp_session: Optional[aiohttp.ClientSession] = None
+
+# 解析结果缓存：避免同一份简历重复OCR/PDF和大模型调用
+_parse_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+# 仅缓存大模型推理结果（按简历文本哈希）
+_llm_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_CACHE_TTL_SECONDS = 600
+
+
+def _build_cache_key(file_path: str) -> Optional[str]:
+    """基于文件内容构建缓存key（不含临时路径），支持上传到不同临时文件时复用。"""
+    try:
+        stat = os.stat(file_path)
+        hasher = hashlib.sha1()
+        hasher.update(str(stat.st_size).encode())
+        with open(file_path, "rb") as f:
+            head = f.read(65536)
+            hasher.update(head)
+            if stat.st_size > 65536:
+                f.seek(max(0, stat.st_size - 65536))
+                hasher.update(f.read(65536))
+        return hasher.hexdigest()
+    except Exception as e:
+        logger.warning(f"生成缓存Key失败: {e}")
+        return None
+
+
+def _build_text_cache_key(text: str) -> str:
+    """按简历文本内容缓存大模型结果。"""
+    return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _normalize_resume_text(text: str, max_chars: int = 7000) -> str:
+    """清洗OCR/PDF文本并限制输入长度，降低大模型推理延迟。"""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    compact_text = "\n".join(lines)
+    if len(compact_text) <= max_chars:
+        return compact_text
+    logger.info(f"简历文本过长({len(compact_text)} chars)，截断到 {max_chars} chars 以加速推理")
+    return compact_text[:max_chars]
+
+
+def _get_cache_from(cache: Dict[str, Tuple[float, Dict[str, Any]]], cache_key: str) -> Optional[Dict[str, Any]]:
+    """读取缓存，命中且未过期则返回。"""
+    cached = cache.get(cache_key)
+    if not cached:
+        return None
+    ts, payload = cached
+    if time.time() - ts > _CACHE_TTL_SECONDS:
+        cache.pop(cache_key, None)
+        return None
+    return payload
+
+
+def _get_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    return _get_cache_from(_parse_cache, cache_key)
+
+
+def _set_cache(cache_key: str, payload: Dict[str, Any]) -> None:
+    _parse_cache[cache_key] = (time.time(), payload)
+
+
+def _cleanup_single_cache(cache: Dict[str, Tuple[float, Dict[str, Any]]], max_size: int = 256) -> None:
+    """轻量清理过期缓存，限制内存占用。"""
+    now = time.time()
+    expired_keys = [k for k, (ts, _) in cache.items() if now - ts > _CACHE_TTL_SECONDS]
+    for key in expired_keys:
+        cache.pop(key, None)
+
+    if len(cache) <= max_size:
+        return
+    # 删除最旧的条目
+    sorted_items = sorted(cache.items(), key=lambda item: item[1][0])
+    for key, _ in sorted_items[: len(cache) - max_size]:
+        cache.pop(key, None)
+
+
+def _cleanup_cache() -> None:
+    _cleanup_single_cache(_parse_cache)
+    _cleanup_single_cache(_llm_cache)
 
 
 def get_ocr_instance() -> RapidOCR:
@@ -219,18 +299,36 @@ def _sync_pdf_process(pdf_path: str) -> str:
         words = page.extract_words()
 
         # 寻找候选分割线 (x 轴 25% - 45% 区域)
+        # 优化：使用区间合并替代逐像素遍历，降低CPU开销
         page_width = page.width
-        has_text = [False] * int(page_width)
+        x_start = int(page_width * 0.25)
+        x_end = int(page_width * 0.45)
+
+        intervals: List[Tuple[int, int]] = []
         for w in words:
-            for x in range(int(w['x0']), int(w['x1'])):
-                if x < len(has_text):
-                    has_text[x] = True
+            left = max(x_start, int(w['x0']))
+            right = min(x_end, int(w['x1']))
+            if right > left:
+                intervals.append((left, right))
+
+        intervals.sort(key=lambda item: item[0])
+
+        merged: List[Tuple[int, int]] = []
+        for left, right in intervals:
+            if not merged or left > merged[-1][1]:
+                merged.append((left, right))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], right))
 
         split_x = None
-        for x in range(int(page_width * 0.25), int(page_width * 0.45)):
-            if not has_text[x]:
-                split_x = x
+        cursor = x_start
+        for left, right in merged:
+            if cursor < left:
+                split_x = cursor
                 break
+            cursor = max(cursor, right)
+        if split_x is None and cursor < x_end:
+            split_x = cursor
 
         # 核心逻辑：判断是"独立双栏"还是"横向表格"
         is_true_double_column = False
@@ -238,12 +336,11 @@ def _sync_pdf_process(pdf_path: str) -> str:
             left_words = [w for w in words if w['x1'] <= split_x]
             right_words = [w for w in words if w['x0'] >= split_x]
 
-            overlap_rows = 0
-            for lw in left_words:
-                for rw in right_words:
-                    if abs(lw['top'] - rw['top']) < 3:
-                        overlap_rows += 1
-                        break
+            # 优化：O(n^2) 行对比改为集合匹配
+            right_row_marks = {int(round(float(rw['top']) / 3)) for rw in right_words}
+            overlap_rows = sum(
+                1 for lw in left_words if int(round(float(lw['top']) / 3)) in right_row_marks
+            )
 
             if len(left_words) > 0 and (overlap_rows / len(left_words)) < 0.3:
                 is_true_double_column = True
@@ -274,6 +371,13 @@ async def extract_text_from_pdf_async(pdf_path: str) -> str:
 
 async def resume_text_get(resume_text: str, max_retries: int = 2) -> Dict:
     """优化后的大模型解析，带重试机制和连接池复用"""
+    normalized_text = _normalize_resume_text(resume_text)
+    text_cache_key = _build_text_cache_key(normalized_text)
+    llm_cached = _get_cache_from(_llm_cache, text_cache_key)
+    if llm_cached is not None:
+        logger.info("命中LLM结果缓存，跳过大模型调用")
+        return llm_cached
+
     parse_resume_prompt = """
     你是一个简历解析助手。
     请将以下OCR文本解析为JSON，严格按照下面结构输出：
@@ -332,7 +436,7 @@ async def resume_text_get(resume_text: str, max_retries: int = 2) -> Dict:
         "model": "qwen-flash",
         "messages": [
             {"role": "system", "content": parse_resume_prompt},
-            {"role": "user", "content": f"请分析以下简历文本：\n{resume_text}"}
+            {"role": "user", "content": f"请分析以下简历文本：\n{normalized_text}"}
         ],
         "response_format": {"type": "json_object"}
     }
@@ -346,7 +450,10 @@ async def resume_text_get(resume_text: str, max_retries: int = 2) -> Dict:
                 if response.status == 200:
                     result = await response.json()
                     content = result.get('choices', [{}])[0].get('message', {}).get('content', '')
-                    return json.loads(content)
+                    parsed = json.loads(content)
+                    _llm_cache[text_cache_key] = (time.time(), parsed)
+                    _cleanup_cache()
+                    return parsed
                 else:
                     error_text = await response.text()
                     logger.warning(f"API返回错误状态码: {response.status}, 内容: {error_text}")
@@ -383,6 +490,13 @@ async def parse_resume(inputs: str) -> Dict:
     # 使用信号量限制并发，防止资源耗尽
     async with get_semaphore():
         start_time = time.time()
+        cache_key = _build_cache_key(inputs)
+
+        if cache_key:
+            cached_result = _get_cache(cache_key)
+            if cached_result is not None:
+                logger.info(f"命中解析缓存，总耗时: {time.time() - start_time:.2f}s")
+                return cached_result
 
         try:
             # ================= 图片简历 =================
@@ -395,6 +509,9 @@ async def parse_resume(inputs: str) -> Dict:
                 # 异步大模型解析
                 qwen_result = await resume_text_get(resume_text)
                 logger.info(f"大模型解析完成，总耗时: {time.time() - start_time:.2f}s")
+                if cache_key:
+                    _set_cache(cache_key, qwen_result)
+                    _cleanup_cache()
                 return qwen_result
 
             # ================= PDF 简历 =================
@@ -407,6 +524,9 @@ async def parse_resume(inputs: str) -> Dict:
                 # 异步大模型解析
                 qwen_result = await resume_text_get(text)
                 logger.info(f"大模型解析完成，总耗时: {time.time() - start_time:.2f}s")
+                if cache_key:
+                    _set_cache(cache_key, qwen_result)
+                    _cleanup_cache()
                 return qwen_result
 
             else:
@@ -425,11 +545,7 @@ async def async_copy_file(src, dst_path: str, chunk_size: int = 8192):
 
     def _sync_copy():
         with open(dst_path, 'wb') as dst:
-            while True:
-                chunk = src.read(chunk_size)
-                if not chunk:
-                    break
-                dst.write(chunk)
+            shutil.copyfileobj(src, dst, length=chunk_size)
 
     await loop.run_in_executor(None, _sync_copy)
 
@@ -470,7 +586,7 @@ async def parse_upload(file: UploadFile = File(...)) -> Any:
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp:
             tmp_path = tmp.name
             # 异步写入文件内容，避免阻塞事件循环
-            await async_copy_file(file.file, tmp_path)
+            await async_copy_file(file.file, tmp_path, chunk_size=1024 * 1024)
 
         logger.info(f"文件已保存到临时路径: {tmp_path}")
 
