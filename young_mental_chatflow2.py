@@ -131,6 +131,12 @@ async def process_streaming_response(response, query: str = ""):
     # ✅ 新增：标记第一个消息和缓存最后一个消息
     first_message = True
     pending_message = None  # 用于缓存上一个 message 事件
+    text_buffer = ""  # 文本聚合缓冲，减少过碎切片导致的 TTS 卡顿
+
+    # TTS 友好的分段参数（只改变分段策略，不改变输出结构）
+    TTS_MIN_CHARS = 18
+    TTS_MAX_CHARS = 70
+    TTS_SOFT_PUNCT = "，。！？；：,.!?;:"
 
     # 测试模式标记
     test_trigger = query == "1qaz@WSX#EDC"
@@ -143,6 +149,43 @@ async def process_streaming_response(response, query: str = ""):
         'answer': {'type': 'fallback', 'interviewStatus': False, 'dialogRound': 0, 'desc': '兜底回复'},
         '1774489837177': {'type': 'consultation', 'interviewStatus': True, 'dialogRound': 1, 'desc': '问题咨询'}
     }
+
+    def emit_text_message(text: str):
+        """构造统一 message 事件（保持原有数据结构）"""
+        if not text:
+            return None
+        simplified = {
+            "event": "message",
+            "conversation_id": conversation_id,
+            "created_at": created_at,
+            "intent": current_intent,
+            "answer": text
+        }
+        return f"data: {json.dumps(simplified, ensure_ascii=False)}\n\n"
+
+    def split_tts_friendly_segments(text: str):
+        """按语义标点优先切片，避免极短碎片造成语音卡顿"""
+        segments = []
+        while len(text) >= TTS_MIN_CHARS:
+            search_end = min(len(text), TTS_MAX_CHARS)
+            split_index = -1
+
+            for idx in range(search_end - 1, -1, -1):
+                if text[idx] in TTS_SOFT_PUNCT and idx + 1 >= TTS_MIN_CHARS:
+                    split_index = idx + 1
+                    break
+
+            if split_index == -1:
+                if len(text) >= TTS_MAX_CHARS:
+                    split_index = TTS_MAX_CHARS
+                else:
+                    break
+
+            segment = text[:split_index]
+            segments.append(segment)
+            text = text[split_index:]
+
+        return segments, text
 
     async for line in response.aiter_lines():
         if not line or line.startswith(":"):
@@ -216,15 +259,6 @@ async def process_streaming_response(response, query: str = ""):
                     if answer:
                         full_answer += answer
 
-                        # ✅ 关键修改：构建消息但不立即发送，缓存起来等待确认是否是最后一个
-                        simplified = {
-                            "event": "message",
-                            "conversation_id": conversation_id,
-                            "created_at": created_at,
-                            "intent": current_intent,
-                            "answer": answer
-                        }
-
                         # 首个消息块到达时立即发送 node_started（如未发送）
                         if not start_event_sent and conversation_id:
                             start_event = {
@@ -236,8 +270,15 @@ async def process_streaming_response(response, query: str = ""):
                             yield f"data: {json.dumps(start_event, ensure_ascii=False)}\n\n"
                             start_event_sent = True
 
-                        # 缓存当前消息（此时不确定它是否是最后一个）
-                        pending_message = f"data: {json.dumps(simplified, ensure_ascii=False)}\n\n"
+                        text_buffer += answer
+                        ready_segments, text_buffer = split_tts_friendly_segments(text_buffer)
+
+                        for segment in ready_segments:
+                            # 有新片段可发时，先把上一个已确认非末尾片段发出
+                            if pending_message is not None:
+                                yield pending_message
+                            # 缓存当前消息（此时不确定它是否是最后一个）
+                            pending_message = emit_text_message(segment)
 
                 elif event_type == 'node_finished':
                     data = json_data.get('data') or {}
@@ -253,6 +294,11 @@ async def process_streaming_response(response, query: str = ""):
                     elif node_type == 'answer' and node_id in BRANCH_MAP:
                         if not test_trigger:
                             current_branch = BRANCH_MAP[node_id]
+
+                            # node_finished 前先把残余文本作为最后片段输出
+                            if text_buffer:
+                                pending_message = emit_text_message(text_buffer)
+                                text_buffer = ""
 
                             # ✅ 关键修改：在发送 node_finished 之前，处理并发送最后一个 message
                             if pending_message is not None:
@@ -280,6 +326,11 @@ async def process_streaming_response(response, query: str = ""):
                             yield f"data: {json.dumps(final_event, ensure_ascii=False)}\n\n"
 
                 elif event_type == 'error':
+                    # error 前先把残余文本作为最后片段输出
+                    if text_buffer:
+                        pending_message = emit_text_message(text_buffer)
+                        text_buffer = ""
+
                     # ✅ 关键修改：在发送 error 事件之前，先处理并发送最后一个 message（如果存在）
                     if pending_message is not None:
                         try:
@@ -307,6 +358,10 @@ async def process_streaming_response(response, query: str = ""):
                 yield f"data: {json.dumps({'event': 'parse_error', 'error': str(e)}, ensure_ascii=False)}\n\n"
 
     # ✅ 关键修改：流结束后的清理 - 处理最后一个 message（如果流意外结束没有 node_finished）
+    if text_buffer:
+        pending_message = emit_text_message(text_buffer)
+        text_buffer = ""
+
     if pending_message is not None:
         try:
             msg_json_str = pending_message[5:].strip()
