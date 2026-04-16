@@ -230,6 +230,100 @@ def _experience_score(resume_data: Dict[str, Any], job_text: str) -> float:
     return float(np.clip(base, 0.1, 1.0))
 
 
+def _extract_skill_tokens(text: str) -> List[str]:
+    """从岗位/简历文本中提取通用技能 token（中英文）。"""
+    if not text:
+        return []
+
+    patterns = [
+        r"Python|Java|Go|Rust|C\+\+|C#|JavaScript|TypeScript|SQL|MySQL|PostgreSQL|Redis|MongoDB|Elasticsearch",
+        r"Spring|Django|Flask|FastAPI|React|Vue|Angular|Node\.js|Docker|Kubernetes|Linux|Git",
+        r"机器学习|深度学习|自然语言处理|数据分析|数据挖掘|算法|推荐系统|测试开发|自动化测试|运维|前端|后端|全栈",
+        r"运营|新媒体|内容编辑|销售|客服|教师|财务|会计|人力资源|行政|设计|剪辑|摄影",
+    ]
+
+    hits: List[str] = []
+    for p in patterns:
+        hits.extend(re.findall(p, text, flags=re.IGNORECASE))
+
+    # 补充短中文词（2-6字）
+    zh_hits = re.findall(r"[\u4e00-\u9fff]{2,6}", text)
+    hits.extend(zh_hits)
+    unique = []
+    seen = set()
+    for h in hits:
+        key = h.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(h.strip())
+    return unique
+
+
+def _skill_coverage_score(resume_data: Dict[str, Any], job_name: str, job_describe: str) -> Tuple[float, int]:
+    """
+    计算技能覆盖度，返回 (coverage, core_missing_count)。
+    - coverage: 0~1
+    - core_missing_count: 未覆盖的核心技能数量
+    """
+    jd_text = f"{job_name}\n{job_describe[:1200]}"
+    jd_tokens = _extract_skill_tokens(jd_text)
+    if not jd_tokens:
+        return 0.6, 0
+
+    # 岗位前若干 token 视为核心技能
+    core_tokens = jd_tokens[:12]
+
+    resume_text_parts = [
+        build_resume_text(resume_data),
+        json.dumps(resume_data.get("skills", ""), ensure_ascii=False),
+        json.dumps(resume_data.get("project_exp", ""), ensure_ascii=False),
+        json.dumps(resume_data.get("work_exp", ""), ensure_ascii=False),
+        json.dumps(resume_data.get("internship_exp", ""), ensure_ascii=False),
+    ]
+    resume_text = "\n".join([p for p in resume_text_parts if p])
+    resume_tokens = set([t.lower() for t in _extract_skill_tokens(resume_text)])
+
+    matched = 0
+    core_missing = 0
+    for t in core_tokens:
+        t_low = t.lower()
+        is_hit = any((t_low in rt) or (rt in t_low) for rt in resume_tokens)
+        if is_hit:
+            matched += 1
+        else:
+            core_missing += 1
+
+    coverage = matched / max(1, len(core_tokens))
+    # 非线性拉开区分：低覆盖降得更明显
+    coverage = float(np.clip(coverage ** 1.35, 0.0, 1.0))
+    return coverage, core_missing
+
+
+def _requirement_penalty(resume_data: Dict[str, Any], job_text: str) -> float:
+    """
+    根据招聘硬条件做惩罚，提升不匹配岗位的低分能力。
+    返回 [0, 0.35] 惩罚值。
+    """
+    penalty = 0.0
+    exp_count = len(resume_data.get("project_exp", []) or []) + len(resume_data.get("work_exp", []) or []) + len(resume_data.get("internship_exp", []) or [])
+
+    year_reqs = re.findall(r"([1-9])\s*年", job_text)
+    if year_reqs:
+        min_year = min(int(y) for y in year_reqs)
+        # 用经历条数近似映射经验：每2段≈1年
+        est_year = exp_count / 2.0
+        gap = min_year - est_year
+        if gap >= 2:
+            penalty += 0.20
+        elif gap >= 1:
+            penalty += 0.12
+
+    if any(k in job_text for k in ["资深", "高级", "负责人", "管理"]) and exp_count <= 1:
+        penalty += 0.10
+
+    return float(np.clip(penalty, 0.0, 0.35))
+
+
 async def _semantic_signals(resume_data: Dict[str, Any], job_name: str, job_describe: str) -> Tuple[float, float, float]:
     """
     返回: (resume_vs_job, intent_vs_job, major_vs_job) ∈ [0,1]
@@ -327,26 +421,40 @@ async def calc_delivery_score(
         return 0.0
 
     resume_vs_job, intent_vs_job, major_vs_job = await _semantic_signals(resume_data, job_name, job_describe)
+    skill_coverage, core_missing = _skill_coverage_score(resume_data, job_name, job_describe)
     city = _city_score(work_city, job_cities)
     exp = _experience_score(resume_data, f"{job_name}\n{job_describe}")
 
     # 粗排：更可解释，覆盖真实招聘中的关键维度
     coarse_score = (
-        0.40 * resume_vs_job +
-        0.20 * intent_vs_job +
-        0.15 * major_vs_job +
-        0.15 * city +
+        0.30 * resume_vs_job +
+        0.15 * intent_vs_job +
+        0.10 * major_vs_job +
+        0.25 * skill_coverage +
+        0.10 * city +
         0.10 * exp
     )
 
     rerank_score = await _rerank_score(resume_data, job_name, job_describe)
 
-    # 与推荐系统一致的融合策略，并加协同校正避免“推荐高、投递低”
-    final_score = COARSE_SCORE_WEIGHT * coarse_score + RERANK_SCORE_WEIGHT * rerank_score
+    # 与推荐系统保持一致的粗排/精排融合，再做分数拉伸和惩罚校正
+    final_raw = COARSE_SCORE_WEIGHT * coarse_score + RERANK_SCORE_WEIGHT * rerank_score
+    # 通过 Sigmoid 拉开高低分差，解决“都在中间分”的问题
+    final_score = float(1.0 / (1.0 + np.exp(-6.2 * (final_raw - 0.52))))
+
+    # 不匹配惩罚：核心技能缺失 + 硬条件经验不足 + 城市明显不匹配
+    penalty = _requirement_penalty(resume_data, f"{job_name}\n{job_describe}")
+    if core_missing >= 6:
+        penalty += 0.18
+    elif core_missing >= 4:
+        penalty += 0.10
+    if city <= 0.35:
+        penalty += 0.08
+    final_score -= min(0.35, penalty)
 
     # 协同校正：语义很高时给出保底，避免投递分严重背离推荐排序
-    if resume_vs_job >= 0.72 and intent_vs_job >= 0.60:
-        floor = min(0.92, coarse_score * 0.92)
+    if resume_vs_job >= 0.72 and intent_vs_job >= 0.60 and skill_coverage >= 0.58:
+        floor = min(0.94, coarse_score * 0.95)
         final_score = max(final_score, floor)
 
     return round(float(np.clip(final_score, 0.0, 1.0)), 4)
