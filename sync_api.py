@@ -152,18 +152,29 @@ class Embedder:
             return ""
         text = re.sub(r"\s+", " ", text)
         text = re.sub(r"[!！。]{2,}", "。", text)
-        return text[:120]
+        text = re.sub(r"(欢迎光临|全城最低|火爆热销|扫码关注|点击领取优惠券)", "", text)
+        return text.strip("，,。.;； ")
 
     @classmethod
     def _rewrite_to_search_brief(cls, name: str, raw_desc: str, entity_type: str) -> str:
         normalized = cls._normalize_description(raw_desc)
         if not normalized:
             return ""
-        stripped = re.sub(r"[\W_]+", "", normalized)
-        # 描述噪音较高时，退化为稳定的“名称+类型”短文本
-        if len(stripped) < 6:
+        sentences = [s.strip() for s in re.split(r"[。！？!?\n]", normalized) if s.strip()]
+        candidate = ""
+        for s in sentences:
+            stripped = re.sub(r"[\W_]+", "", s)
+            if len(stripped) >= 8:
+                candidate = s
+                break
+        if not candidate and sentences:
+            candidate = sentences[0]
+        if not candidate:
             return f"{name}，{entity_type}" if name else entity_type
-        return normalized
+        # 避免过长，把摘要压到单句但不硬截断语义
+        if len(candidate) > 48:
+            candidate = candidate[:48].rstrip("，,。.;； ") + "。"
+        return candidate
 
 
     def _rewrite_with_llm(self, name: str, raw_desc: str, entity_type: str) -> str:
