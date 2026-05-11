@@ -142,80 +142,96 @@ class Embedder:
         self.dense_dim = config.DENSE_DIM
         self.sparse_dim = config.SPARSE_DIM
         dashscope.api_key = self.api_key
+        self.enable_llm_rewrite = bool(getattr(config, "SEARCH_REWRITE_ENABLE", False))
+        self.rewrite_model = getattr(config, "SEARCH_REWRITE_MODEL", "qwen-turbo")
 
     @staticmethod
-    def build_description_text(merchant: dict) -> str:
-        parts = []
-        name = merchant.get("name", "")
-        if name:
-            parts.append(f"店铺名称：{name}")
-        slogen = merchant.get("slogen", "") or ""
-        if slogen:
-            parts.append(f"宣传语：{slogen}")
-        description = merchant.get("description", "") or ""
-        if description:
-            parts.append(f"简介：{description}")
-        content = merchant.get("content", "") or ""
-        if content:
-            parts.append(f"商家故事：{content}")
-        address = merchant.get("address", "") or ""
-        if address:
-            parts.append(f"所在地址：{address}")
-        business_area = merchant.get("business_area", "") or ""
-        if business_area:
-            parts.append(f"所属商圈：{business_area}")
-        digitalization = merchant.get("digitalization", "") or ""
-        if digitalization:
-            parts.append(f"数字化平台：{digitalization}")
-        return "\n".join(parts)
+    def _normalize_description(text: str) -> str:
+        text = (text or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"\s+", " ", text)
+        text = re.sub(r"[!！。]{2,}", "。", text)
+        return text[:120]
 
-    @staticmethod
-    def build_campus_text(campus: dict) -> str:
-        parts = []
-        name = campus.get("name", "")
-        if name:
-            parts.append(f"点位名称：{name}")
-        address = campus.get("address", "") or ""
-        if address:
-            parts.append(f"所在地址：{address}")
-        service_summary = campus.get("service_summary", "") or ""
-        if service_summary:
-            parts.append(f"服务内容简介：{service_summary}")
-        service_target = campus.get("service_target", "") or ""
-        if service_target:
-            parts.append(f"服务人群：{service_target}")
-        return "\n".join(parts)
+    @classmethod
+    def _rewrite_to_search_brief(cls, name: str, raw_desc: str, entity_type: str) -> str:
+        normalized = cls._normalize_description(raw_desc)
+        if not normalized:
+            return ""
+        stripped = re.sub(r"[\W_]+", "", normalized)
+        # 描述噪音较高时，退化为稳定的“名称+类型”短文本
+        if len(stripped) < 6:
+            return f"{name}，{entity_type}" if name else entity_type
+        return normalized
 
-    @staticmethod
-    def build_course_text(course: dict) -> str:
-        parts = []
-        name = course.get("name", "")
-        if name:
-            parts.append(f"课程名称：{name}")
-        address = course.get("address", "") or ""
-        if address:
-            parts.append(f"所在地址：{address}")
-        description = course.get("description", "") or ""
-        if description:
-            parts.append(f"课程简介：{description}")
-        return "\n".join(parts)
 
-    @staticmethod
-    def build_apartment_text(apartment: dict) -> str:
-        parts = []
-        name = apartment.get("name", "")
-        if name:
-            parts.append(f"公寓名称：{name}")
-        description = apartment.get("description", "") or ""
-        if description:
-            parts.append(f"简介：{description}")
-        slogan = apartment.get("slogan", "") or ""
-        if slogan:
-            parts.append(f"标语：{slogan}")
-        address = apartment.get("address", "") or ""
-        if address:
-            parts.append(f"所在地址：{address}")
-        return "\n".join(parts)
+    def _rewrite_with_llm(self, name: str, raw_desc: str, entity_type: str) -> str:
+        if not self.enable_llm_rewrite:
+            return ""
+        prompt = (
+            "你是本地生活搜索优化助手。请把下面信息改写成15~30字中文短句，仅保留实体类型与主营内容，不要地址、营销词。\n"
+            f"名称：{name}\n类型：{entity_type}\n原描述：{raw_desc}\n"
+            "只输出改写结果。"
+        )
+        try:
+            resp = dashscope.Generation.call(
+                model=self.rewrite_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=80,
+                result_format="message",
+            )
+            if resp.status_code == HTTPStatus.OK:
+                content = ((resp.output or {}).get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+                return self._normalize_description(content)
+        except Exception as e:
+            logger.warning(f"LLM rewrite failed, fallback to rule-based text: {e}")
+        return ""
+
+    def build_description_text(self, merchant: dict) -> str:
+        name = (merchant.get("name", "") or "").strip()
+        category = (merchant.get("category_name", "") or "").strip()
+        if not category:
+            cid = merchant.get("category_id")
+            category = f"小店分类{cid}" if cid not in (None, "") else "小店"
+        brief = self._rewrite_with_llm(name, merchant.get("description", ""), category)
+        if not brief:
+            brief = self._rewrite_to_search_brief(name, merchant.get("description", ""), category)
+        parts = [f"店铺名称：{name}", f"店铺类型：{category}"]
+        if brief:
+            parts.append(f"店铺简介：{brief}")
+        return "\n".join([p for p in parts if p and not p.endswith("：")])
+
+    def build_campus_text(self, campus: dict) -> str:
+        name = (campus.get("name", "") or "").strip()
+        brief = self._rewrite_with_llm(name, campus.get("service_summary", ""), "夜校")
+        if not brief:
+            brief = self._rewrite_to_search_brief(name, campus.get("service_summary", ""), "夜校")
+        parts = [f"夜校名称：{name}", "类型：夜校"]
+        if brief:
+            parts.append(f"简介：{brief}")
+        return "\n".join([p for p in parts if p])
+
+    def build_course_text(self, course: dict) -> str:
+        name = (course.get("name", "") or "").strip()
+        brief = self._rewrite_with_llm(name, course.get("description", ""), "课程")
+        if not brief:
+            brief = self._rewrite_to_search_brief(name, course.get("description", ""), "课程")
+        parts = [f"课程名称：{name}", "类型：课程"]
+        if brief:
+            parts.append(f"简介：{brief}")
+        return "\n".join([p for p in parts if p])
+
+    def build_apartment_text(self, apartment: dict) -> str:
+        name = (apartment.get("name", "") or "").strip()
+        brief = self._rewrite_with_llm(name, apartment.get("description", ""), "公寓")
+        if not brief:
+            brief = self._rewrite_to_search_brief(name, apartment.get("description", ""), "公寓")
+        parts = [f"公寓名称：{name}", "类型：公寓"]
+        if brief:
+            parts.append(f"简介：{brief}")
+        return "\n".join([p for p in parts if p])
 
     def get_embeddings(self, texts: List[str]) -> Tuple[List[List[float]], List[Dict[int, float]]]:
         if not texts:
@@ -293,11 +309,9 @@ class Embedder:
     def _hash_token(token: str) -> int:
         return int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16)
 
-    def embed_merchants(self, merchants: List[dict]) -> Tuple[List[List[float]], List[Dict[int, float]], List[str]]:
-        texts = [self.build_description_text(m) for m in merchants]
-        logger.info(f"Generating embeddings for {len(merchants)} merchants via {self.model}...")
-        dense_vectors, sparse_vectors = self.get_embeddings(texts)
-        return dense_vectors, sparse_vectors, texts
+    def embed_texts(self, texts: List[str]) -> Tuple[List[List[float]], List[Dict[int, float]]]:
+        logger.info(f"Generating embeddings for {len(texts)} texts via {self.model}...")
+        return self.get_embeddings(texts)
 
     def embed_query(self, query: str) -> Tuple[List[float], Dict[int, float]]:
         dense, sparse = self.get_embeddings([query])
@@ -1061,7 +1075,7 @@ class SyncService:
             valid_records.append(r)
         if not valid_records:
             return []
-        dense_vectors, sparse_vectors, _ = self.embedder.embed_merchants(valid_records)
+        dense_vectors, sparse_vectors = self.embedder.embed_texts(texts)
         milvus_records = []
         for i, r in enumerate(valid_records):
             milvus_records.append(self._to_milvus_record(
