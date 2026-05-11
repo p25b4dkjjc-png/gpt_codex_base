@@ -372,6 +372,13 @@ class TypeIntentRecognizer:
         "课程": {"课程", "培训", "学习", "教程", "网课", "线下课", "体验课", "试听课", "公开课", "讲座"},
         "夜校": {"夜校", "青年中心", "自习", "活动空间", "青年之家"},
     }
+    # 负向词典：当用户搜索某类型时，出现这些词的候选应降权或过滤
+    NEGATIVE_KEYWORDS = {
+        "apartment": {"酒吧", "咖啡", "奶茶", "火锅", "烧烤", "理发", "剪发"},
+        "merchant": {"公寓", "租房", "整租", "合租", "夜校", "课程"},
+        "course": {"公寓", "租房", "酒吧", "奶茶"},
+        "campus": {"公寓", "租房", "酒吧", "咖啡"},
+    }
 
     def recognize(self, query: str) -> Tuple[List[str], Dict[str, float]]:
         if not query:
@@ -420,6 +427,18 @@ class TypeIntentRecognizer:
             if kw in self.KEYWORD_SYNONYMS:
                 expanded.update(self.KEYWORD_SYNONYMS[kw])
         return expanded
+
+    def get_dominant_types(self, type_weights: Dict[str, float], threshold: float = 1.35) -> List[str]:
+        if not type_weights:
+            return []
+        max_w = max(type_weights.values())
+        return [t for t, w in type_weights.items() if w >= max(threshold, max_w - 0.05)]
+
+    def get_negative_keywords(self, dominant_types: List[str]) -> Set[str]:
+        negatives: Set[str] = set()
+        for t in dominant_types:
+            negatives.update(self.NEGATIVE_KEYWORDS.get(t, set()))
+        return negatives
 
 
 # ==================== 规则重排引擎（生产级 v2.6） ====================
@@ -535,12 +554,13 @@ class RuleRanker:
 
         # 判断意图明确度
         max_tw = max(type_weights.values())
-        dominant_types = [t for t, w in type_weights.items() if w == max_tw]
+        dominant_types = type_recognizer.get_dominant_types(type_weights)
         is_strong_intent = (max_tw >= 1.5 and sync_type == "all" and
                             sum(1 for w in type_weights.values() if w <= 0.3) >= 3)
 
         # 扩展关键词
         expanded_kws = type_recognizer.expand_keywords(keywords)
+        negative_kws = type_recognizer.get_negative_keywords(dominant_types)
         query_lower = query.lower().replace(" ", "").replace("·", "")
         max_raw = max(h.get("distance", 0) for h in hits)
 
@@ -572,6 +592,12 @@ class RuleRanker:
                     # 未命中任何扩展关键词，直接丢弃（无论语义分多高）
                     logger.debug(f"[Gate] 强过滤丢弃 id={h.get('id')} name={name} type={t} "
                                  f"原因：未命中扩展关键词 {expanded_kws}")
+                    continue
+
+            # 准入2.5：强探索下，非主类型命中负向词直接丢弃（例如“公寓”不混入“酒吧”）
+            if query_mode == "exp_strong" and is_strong_intent and t not in dominant_types:
+                if any(nk in text for nk in negative_kws):
+                    logger.debug(f"[Gate] 负向词过滤 id={h.get('id')} type={t} negatives={negative_kws}")
                     continue
 
             # 准入3：非目标类型或弱意图：语义分阈值
