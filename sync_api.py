@@ -160,6 +160,9 @@ class Embedder:
         normalized = cls._normalize_description(raw_desc)
         if not normalized:
             return ""
+        # 课程大纲类文本（如“第1课时…第2课时…”）保留主要结构，避免语义被截断
+        if re.search(r"第\s*\d+\s*课时", normalized):
+            return normalized if len(normalized) <= 220 else normalized[:220].rstrip("，,。.;； ") + "。"
         sentences = [s.strip() for s in re.split(r"[。！？!?\n]", normalized) if s.strip()]
         candidate = ""
         for s in sentences:
@@ -171,9 +174,9 @@ class Embedder:
             candidate = sentences[0]
         if not candidate:
             return f"{name}，{entity_type}" if name else entity_type
-        # 避免过长，把摘要压到单句但不硬截断语义
-        if len(candidate) > 48:
-            candidate = candidate[:48].rstrip("，,。.;； ") + "。"
+        # 避免过长：放宽上限，尽量保留业务语义
+        if len(candidate) > 120:
+            candidate = candidate[:120].rstrip("，,。.;； ") + "。"
         return candidate
 
 
